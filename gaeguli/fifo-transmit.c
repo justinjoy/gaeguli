@@ -145,7 +145,11 @@ struct _GaeguliFifoTransmit
 {
   GObject parent;
 
+  GThread *thread;
   GMutex lock;
+  GCond cond;
+  GMainContext *context;
+  GMainLoop *loop;
 
   gchar *fifo_dir;
   gchar *fifo_path;
@@ -217,6 +221,22 @@ gaeguli_fifo_transmit_dispose (GObject * object)
 
   g_clear_object (&self->cancellable);
 
+  if (self->loop) {
+    g_main_loop_quit (self->loop);
+
+    if (self->thread != g_thread_self ())
+      g_thread_join (self->thread);
+    else
+      g_thread_unref (self->thread);
+    self->thread = NULL;
+
+    g_main_loop_unref (self->loop);
+    self->loop = NULL;
+
+    g_main_context_unref (self->context);
+    self->context = NULL;
+  }
+
   if (g_atomic_int_dec_and_test (&srt_init_refcount)) {
     srt_cleanup ();
     g_debug ("Cleaning up SRT");
@@ -225,11 +245,58 @@ gaeguli_fifo_transmit_dispose (GObject * object)
   G_OBJECT_CLASS (gaeguli_fifo_transmit_parent_class)->dispose (object);
 }
 
+static gboolean
+main_loop_running_cb (gpointer user_data)
+{
+  GaeguliFifoTransmit *self = user_data;
+
+  g_mutex_lock (&self->lock);
+  g_cond_signal (&self->cond);
+  g_mutex_unlock (&self->lock);
+
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer
+gaeguli_fifo_transmit_main (gpointer data)
+{
+  GaeguliFifoTransmit *self = data;
+  GSource *source = g_idle_source_new ();
+
+  g_source_set_callback (source, (GSourceFunc) main_loop_running_cb, self,
+      NULL);
+  g_source_attach (source, self->context);
+  g_source_unref (source);
+
+  g_debug ("Starting main loop");
+  g_main_loop_run (self->loop);
+  g_debug ("Stopped main loop");
+
+  return NULL;
+}
+
+static void
+gaeguli_fifo_transmit_constructed (GObject * object)
+{
+  GaeguliFifoTransmit *self = GAEGULI_FIFO_TRANSMIT (object);
+
+  g_mutex_lock (&self->lock);
+  self->thread =
+      g_thread_new ("GaeguliFifoTransmit", gaeguli_fifo_transmit_main, self);
+
+  while (!self->loop || !g_main_loop_is_running (self->loop))
+    g_cond_wait (&self->cond, &self->lock);
+  g_mutex_unlock (&self->lock);
+
+  G_OBJECT_CLASS (gaeguli_fifo_transmit_parent_class)->constructed (object);
+}
+
 static void
 gaeguli_fifo_transmit_class_init (GaeguliFifoTransmitClass * klass)
 {
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
 
+  object_class->constructed = gaeguli_fifo_transmit_constructed;
   object_class->dispose = gaeguli_fifo_transmit_dispose;
 }
 
@@ -245,6 +312,10 @@ gaeguli_fifo_transmit_init (GaeguliFifoTransmit * self)
   g_atomic_int_inc (&srt_init_refcount);
 
   g_mutex_init (&self->lock);
+  g_cond_init (&self->cond);
+
+  self->context = g_main_context_new ();
+  self->loop = g_main_loop_new (self->context, FALSE);
 
   self->cancellable = g_cancellable_new ();
   self->sockets = g_hash_table_new_full (g_str_hash, g_str_equal,
@@ -662,8 +733,7 @@ gaeguli_fifo_transmit_start (GaeguliFifoTransmit * self,
 
     g_source_set_callback (self->fifo_read_source, (GSourceFunc) _recv_stream,
         weak_ref_new (self), (GDestroyNotify) weak_ref_free);
-    g_source_attach (self->fifo_read_source,
-        g_main_context_get_thread_default ());
+    g_source_attach (self->fifo_read_source, self->context);
   }
 
   transmit_id = g_str_hash (hostinfo);
