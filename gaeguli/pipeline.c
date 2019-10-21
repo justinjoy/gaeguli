@@ -41,7 +41,11 @@ struct _GaeguliPipeline
 {
   GObject parent;
 
+  GThread *thread;
   GMutex lock;
+  GCond cond;
+  GMainContext *context;
+  GMainLoop *loop;
 
   GaeguliVideoSource source;
   gchar *device;
@@ -51,6 +55,8 @@ struct _GaeguliPipeline
 
   GstElement *pipeline;
   GstElement *vsrc;
+
+  GstState target_state;
 
   guint stop_pipeline_event_id;
 };
@@ -144,6 +150,16 @@ static guint signals[LAST_SIGNAL] = { 0 };
 G_DEFINE_TYPE (GaeguliPipeline, gaeguli_pipeline, G_TYPE_OBJECT)
 /* *INDENT-ON* */
 
+static gboolean
+_pipeline_set_state_internal (gpointer user_data)
+{
+  GaeguliPipeline *self = user_data;
+
+  gst_element_set_state (self->pipeline, self->target_state);
+
+  return G_SOURCE_REMOVE;
+}
+
 static void
 gaeguli_pipeline_dispose (GObject * object)
 {
@@ -158,6 +174,22 @@ gaeguli_pipeline_dispose (GObject * object)
   g_clear_pointer (&self->device, g_free);
 
   g_mutex_clear (&self->lock);
+
+  if (self->loop) {
+    g_main_loop_quit (self->loop);
+
+    if (self->thread != g_thread_self ())
+      g_thread_join (self->thread);
+    else
+      g_thread_unref (self->thread);
+    self->thread = NULL;
+
+    g_main_loop_unref (self->loop);
+    self->loop = NULL;
+
+    g_main_context_unref (self->context);
+    self->context = NULL;
+  }
 
   if (g_atomic_int_dec_and_test (&gaeguli_init_refcnt)) {
     g_debug ("Cleaning up GStreamer");
@@ -212,11 +244,63 @@ gaeguli_pipeline_set_property (GObject * object,
   }
 }
 
+static gboolean
+main_loop_running_cb (gpointer user_data)
+{
+  GaeguliPipeline *self = user_data;
+
+  g_mutex_lock (&self->lock);
+  g_cond_signal (&self->cond);
+  g_mutex_unlock (&self->lock);
+
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer
+gaeguli_pipeline_main (gpointer data)
+{
+  GaeguliPipeline *self = data;
+  GSource *source = g_idle_source_new ();
+
+  g_source_set_callback (source, (GSourceFunc) main_loop_running_cb, self,
+      NULL);
+  g_source_attach (source, self->context);
+  g_source_unref (source);
+
+  g_debug ("Starting main loop");
+  g_main_loop_run (self->loop);
+  g_debug ("Stopped main loop");
+
+  if (self->pipeline) {
+    gst_element_set_state (self->pipeline, GST_STATE_NULL);
+  }
+  g_clear_pointer (&self->pipeline, gst_object_unref);
+
+  return NULL;
+}
+
+
+static void
+gaeguli_pipeline_constructed (GObject * object)
+{
+  GaeguliPipeline *self = GAEGULI_PIPELINE (object);
+
+  g_mutex_lock (&self->lock);
+  self->thread = g_thread_new ("GaeguliPipeline", gaeguli_pipeline_main, self);
+
+  while (!self->loop || !g_main_loop_is_running (self->loop))
+    g_cond_wait (&self->cond, &self->lock);
+  g_mutex_unlock (&self->lock);
+
+  G_OBJECT_CLASS (gaeguli_pipeline_parent_class)->constructed (object);
+}
+
 static void
 gaeguli_pipeline_class_init (GaeguliPipelineClass * klass)
 {
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
 
+  object_class->dispose = gaeguli_pipeline_constructed;
   object_class->get_property = gaeguli_pipeline_get_property;
   object_class->set_property = gaeguli_pipeline_set_property;
   object_class->dispose = gaeguli_pipeline_dispose;
@@ -265,6 +349,10 @@ gaeguli_pipeline_init (GaeguliPipeline * self)
   g_atomic_int_inc (&gaeguli_init_refcnt);
 
   g_mutex_init (&self->lock);
+  g_cond_init (&self->cond);
+
+  self->context = g_main_context_new ();
+  self->loop = g_main_loop_new (self->context, FALSE);
 
   /* kv: hash(fifo-path), target_pipeline */
   self->targets = g_hash_table_new_full (NULL, NULL,
@@ -460,7 +548,12 @@ _build_vsrc_pipeline (GaeguliPipeline * self, GaeguliVideoResolution resolution,
   gst_pad_add_probe (tee_sink, GST_PAD_PROBE_TYPE_EVENT_UPSTREAM,
       _drop_reconfigure_cb, NULL, NULL);
 
-  gst_element_set_state (self->pipeline, GST_STATE_PLAYING);
+  g_mutex_lock (&self->lock);
+  self->target_state = GST_STATE_PLAYING;
+  g_mutex_unlock (&self->lock);
+
+  g_main_context_invoke_full (self->context, G_PRIORITY_DEFAULT,
+      _pipeline_set_state_internal, self, NULL);
 
   return TRUE;
 
@@ -540,7 +633,13 @@ _link_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
     gst_element_remove_pad (link_target->self->vsrc, ghost_srcpad);
     gst_element_release_request_pad (tee, srcpad);
     gst_bin_remove (GST_BIN (link_target->self->pipeline), link_target->target);
-    gst_element_set_state (link_target->target, GST_STATE_NULL);
+
+    g_mutex_lock (&self->lock);
+    self->target_state = GST_STATE_NULL;
+    g_mutex_unlock (&self->lock);
+
+    g_main_context_invoke_full (self->context, G_PRIORITY_DEFAULT,
+        _pipeline_set_state_internal, self, NULL);
 
     g_signal_emit (self, signals[SIG_STREAM_STOPPED], 0,
         link_target->target_id);
@@ -713,10 +812,12 @@ gaeguli_pipeline_stop (GaeguliPipeline * self)
   }
 
   g_clear_pointer (&self->vsrc, gst_object_unref);
+#if 0
   if (self->pipeline) {
     gst_element_set_state (self->pipeline, GST_STATE_NULL);
   }
   g_clear_pointer (&self->pipeline, gst_object_unref);
+#endif
 
   g_mutex_unlock (&self->lock);
 }
